@@ -21,6 +21,10 @@ Blog: http://dataeducation.com
 License: 
 	https://github.com/amachanic/sp_whoisactive/blob/master/LICENSE
 *********************************************************************************************/
+/*********************************************************************************************
+Microsoft Dynamics AX 2012 - Database Performance
+(C) 2021, Glauber Cini
+*********************************************************************************************/
 ALTER PROC dbo.sp_WhoIsActive
 (
 --~
@@ -97,6 +101,10 @@ ALTER PROC dbo.sp_WhoIsActive
 	--Interval in seconds to wait before doing the second data pull
 	@delta_interval TINYINT = 0,
 
+    --DAX Specific
+	@get_dax_user BIT = 0,
+	@get_dax_database VARCHAR(255) = 'CONTOSO',
+
 	--List of desired output columns, in desired order
 	--Note that the final output will be the intersection of all enabled features and all 
 	--columns in the list. Therefore, only columns associated with enabled features will 
@@ -106,9 +114,10 @@ ALTER PROC dbo.sp_WhoIsActive
 	--Each element in this list must be one of the valid output column names. Names must be
 	--delimited by square brackets. White space, formatting, and additional characters are
 	--allowed, as long as the list contains exact matches of delimited valid column names.
-	@output_column_list VARCHAR(8000) = '[dd%][session_id][sql_text][sql_command][login_name][wait_info][tasks][tran_log%][cpu%][temp%][block%][reads%][writes%][context%][physical%][query_plan][locks][%]',
-
-	--Column(s) by which to sort output, optionally with sort directions. 
+	@output_column_list VARCHAR(8000) = '[dd%][session_id][sql_text][sql_command][login_name][dax][wait_info][tasks][tran_log%][cpu%][temp%][block%][reads%][writes%][context%][physical%][query_plan][locks][%]',
+    --[dax] => DAX Specific
+	
+    --Column(s) by which to sort output, optionally with sort directions. 
 		--Valid column choices:
 		--session_id, physical_io, reads, physical_reads, writes, tempdb_allocations, 
 		--tempdb_current, CPU, context_switches, used_memory, physical_io_delta, reads_delta, 
@@ -403,6 +412,7 @@ BEGIN;
 		OR @return_schema IS NULL
 		OR @destination_table IS NULL
 		OR @help IS NULL
+		OR @get_dax_user IS NULL --DAX Specific
 	BEGIN;
 		RAISERROR('Input parameters cannot be NULL', 16, 1);
 		RETURN;
@@ -1006,6 +1016,10 @@ BEGIN;
 			SELECT '[request_id]', 43
 			UNION ALL
 			SELECT '[collection_time]', 44
+            --DAX Specific
+            UNION ALL
+            SELECT '[dax]', 45
+			WHERE @get_dax_user = 1
 		) AS x ON 
 			x.column_name LIKE token ESCAPE '|'
 	)
@@ -1176,6 +1190,9 @@ BEGIN;
 			SELECT '[login_time]'
 			UNION ALL
 			SELECT '[program_name]'
+            --DAX Specific
+            UNION ALL
+			SELECT '[dax]'
 		) AS x ON 
 			x.column_name LIKE token ESCAPE '|'
 	)
@@ -1247,6 +1264,7 @@ BEGIN;
 		start_time DATETIME NOT NULL,
 		login_time DATETIME NULL,
 		last_request_start_time DATETIME NULL,
+		dax NVARCHAR(4000) NULL, --DAX Specific
 		PRIMARY KEY CLUSTERED (session_id, request_id, recursion) WITH (IGNORE_DUP_KEY = ON),
 		UNIQUE NONCLUSTERED (transaction_id, session_id, request_id, recursion) WITH (IGNORE_DUP_KEY = ON)
 	);
@@ -2674,7 +2692,18 @@ BEGIN;
 						'NULL '
 				END + 
 					'AS login_time, 
-				x.last_request_start_time
+				x.last_request_start_time,' +
+				--DAX Specific
+				CASE
+					WHEN
+						@output_column_list LIKE '%|[dax|]%' ESCAPE '|'
+						AND @recursion = 1
+							THEN
+								'x.dax '
+					ELSE 
+						'NULL '
+				END + 
+					'AS dax
 			FROM
 			(
 				SELECT TOP(@i)
@@ -2773,7 +2802,15 @@ BEGIN;
 						ELSE 
 							'qs.total_elapsed_time / qs.execution_count '
 					END + 
-						'AS avg_elapsed_time 
+						'AS avg_elapsed_time,' +
+                    --DAX Specific
+					CASE 
+						WHEN NOT (@get_dax_user = 1 AND @recursion = 1) THEN
+							''''''
+						ELSE 
+							'axuser.[Name]'
+					END + 
+						' AS dax
 				FROM
 				(
 					SELECT TOP(@i)
@@ -2863,6 +2900,7 @@ BEGIN;
 						r.transaction_id,
 						sp.database_id,
 						sp.open_tran_count,
+						s.context_info, --DAX Specific
 						' +
 							CASE
 								WHEN EXISTS
@@ -3408,11 +3446,34 @@ BEGIN;
 							AND qs.statement_start_offset = y.statement_start_offset
 							AND qs.statement_end_offset = y.statement_end_offset
 						'
-				END + 
+				END +
+                --DAX Specific
+                CASE 
+					WHEN 
+						NOT 
+						(
+							@get_dax_user = 1 
+							AND @recursion = 1
+						) THEN 
+							''
+					ELSE
+						'LEFT OUTER HASH JOIN
+						(
+							SELECT TOP(@i)
+								*
+							FROM ['+ @get_dax_database +'].[dbo].[UserInfo] WITH(NOLOCK)
+						) AS axuser ON
+							axuser.Id = RTRIM(LTRIM(SUBSTRING(y.context_info, 1, CHARINDEX('' '', RTRIM(LTRIM(y.context_info))))))
+						'
+				END +
+                --DAX Specific 
 			') AS x
 			OPTION (KEEPFIXED PLAN, OPTIMIZE FOR (@i = 1)); ';
 
 		SET @sql_n = CONVERT(NVARCHAR(MAX), @sql);
+
+		-- DAX Specific - DEBUG
+		-- SELECT CAST('<root><![CDATA[' + @sql_n + ']]></root>' AS XML);
 
 		SET @last_collection_start = GETDATE();
 
@@ -3463,6 +3524,7 @@ BEGIN;
 			start_time,
 			login_time,
 			last_request_start_time
+            ,dax --DAX Specific
 		)
 		EXEC sp_executesql 
 			@sql_n,
@@ -5141,6 +5203,7 @@ BEGIN;
 						'WHEN status = N''sleeping'' THEN NULL ' +
 						'ELSE request_id ' +
 					'END AS request_id, ' +
+                    'dax, ' + --DAX Specific
 					'GETDATE() AS collection_time '
 		--End inner column list
 		) +
